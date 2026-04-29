@@ -1,0 +1,125 @@
+scenario_name: emr-eks-pod-scheduling-failure
+description: >
+  Amazon EMR on Amazon EKS job failure due to Kubernetes pod scheduling failures. Spark driver
+  or executor pods cannot be scheduled onto cluster nodes. Covers resource quota
+  exhaustion, insufficient CPU/memory on available nodes, node affinity or
+  toleration mismatches, and pending pod timeouts.
+severity: SEVERE
+symptoms:
+  - "Spark driver or executor pods stuck in Pending state"
+  - "FailedScheduling event: insufficient cpu or insufficient memory"
+  - "Pod unschedulable due to node affinity or toleration mismatch"
+  - "ResourceQuota exceeded for the Amazon EMR namespace"
+  - "Job run timeout waiting for driver pod to start"
+  - "0/N nodes are available: N Insufficient cpu, N Insufficient memory"
+  - "Amazon EMR job transitions to FAILED with pod scheduling timeout"
+investigation_steps:
+  - step_number: 1
+    description: "Retrieve the Amazon EMR job run status and check for scheduling-related failure reasons"
+    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
+    expected_output: "Job state FAILED with failureReason indicating pod scheduling timeout or resource unavailability"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 2
+    description: "Search Amazon EKS cluster logs for FailedScheduling events related to Amazon EMR pods"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /aws/eks/{cluster_id}/cluster
+      --filter-pattern "\"FailedScheduling\" OR \"Unschedulable\" OR \"Insufficient\" OR \"didn't match Pod's node affinity\""
+      --start-time failure_time_epoch_minus_15m
+      --limit 30
+    expected_output: "Kubernetes scheduler events showing why pods could not be placed — resource constraints, affinity rules, or taints"
+    parameters:
+      - cluster_id
+  - step_number: 3
+    description: "Check resource quota usage in the Amazon EMR namespace"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /aws/eks/{cluster_id}/cluster
+      --filter-pattern "\"ResourceQuota\" OR \"exceeded quota\" OR \"forbidden.*quota\""
+      --start-time failure_time_epoch_minus_15m
+      --limit 20
+    expected_output: "Events showing quota violations with current usage vs limits for CPU, memory, and pod count"
+    parameters:
+      - cluster_id
+  - step_number: 4
+    description: "Retrieve Spark logs to check driver startup and executor request patterns"
+    command: "get_spark_logs({virtual_cluster_id}, {job_id})"
+    expected_output: "Driver logs showing executor allocation requests and any timeout waiting for executors"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 5
+    description: "Query CloudWatch metrics for Amazon EKS node group capacity and utilization"
+    command: >
+      get_emr_metrics({virtual_cluster_id},
+      start_time=failure_time-30m, end_time=failure_time+5m)
+    expected_output: "Node group metrics showing CPU/memory utilization near 100% or node count at maximum"
+    parameters:
+      - virtual_cluster_id
+  - step_number: 6
+    description: "Check for cluster autoscaler activity and scaling delays"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /aws/eks/{cluster_id}/cluster
+      --filter-pattern "\"cluster-autoscaler\" OR \"ScaleUp\" OR \"ScaleDown\" OR \"NotReady\" OR \"scaling\""
+      --start-time failure_time_epoch_minus_30m
+      --limit 30
+    expected_output: "Autoscaler logs showing scale-up attempts, delays, or failures to provision new nodes"
+    parameters:
+      - cluster_id
+  - step_number: 7
+    description: "Check for pod restart patterns indicating repeated scheduling and crash loops"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /aws/eks/{cluster_id}/cluster
+      --filter-pattern "\"CrashLoopBackOff\" OR \"BackOff\" OR \"Restarted\" AND \"emr\""
+      --start-time failure_time_epoch_minus_15m
+      --limit 20
+    expected_output: "Events showing pod restart counts and crash loop patterns for Amazon EMR pods"
+    parameters:
+      - cluster_id
+root_cause_patterns:
+  - "Insufficient cluster capacity — all nodes are fully utilized and the cluster autoscaler cannot provision new nodes fast enough"
+  - "ResourceQuota exceeded — the Kubernetes namespace has CPU, memory, or pod count quotas that are exhausted"
+  - "Node affinity mismatch — executor pods require specific node labels (e.g., instance type, availability zone) that no available nodes satisfy"
+  - "Taint/toleration mismatch — nodes have taints that Amazon EMR pods do not tolerate, preventing scheduling"
+  - "Cluster autoscaler disabled or misconfigured — new nodes are not being provisioned when demand exceeds capacity"
+  - "PersistentVolumeClaim pending — executor pods waiting for PVC binding that cannot be satisfied"
+  - "Pod priority preemption — lower-priority Amazon EMR pods are being preempted by higher-priority workloads"
+remediation_actions:
+  - "Increase node group capacity: update the Amazon EKS managed node group max size to accommodate Spark executor demand"
+  - "Adjust resource quotas: increase CPU, memory, and pod count limits in the Amazon EMR namespace ResourceQuota"
+  - "Fix node affinity rules: update Spark pod templates to match available node labels or add labels to nodes"
+  - "Add tolerations: configure spark.kubernetes.executor.podTemplateFile with appropriate tolerations for tainted nodes"
+  - "Enable cluster autoscaler: deploy or fix the Kubernetes cluster autoscaler with appropriate scaling policies"
+  - "Reduce executor resource requests: lower spark.executor.cores and spark.executor.memory to fit more executors per node"
+  - "Use Karpenter for faster scaling: replace cluster autoscaler with Karpenter for sub-minute node provisioning"
+  - "Configure pod priority: set PriorityClass for Amazon EMR pods to prevent preemption by lower-priority workloads"
+related_metrics:
+  - "PendingPodCount"
+  - "NodeCount"
+  - "CPUUtilization"
+  - "MemoryUtilization"
+  - "PodRestartCount"
+  - "AutoscalerScaleUpCount"
+log_patterns:
+  - "FailedScheduling"
+  - "Insufficient cpu"
+  - "Insufficient memory"
+  - "Unschedulable"
+  - "exceeded quota"
+  - "node affinity"
+  - "didn't match"
+  - "taint"
+escalation_contacts:
+  - "eks-infrastructure-team@company.com"
+  - "emr-platform-team@company.com"
+tags:
+  - scheduling
+  - kubernetes
+  - resource-quota
+  - node-affinity
+  - autoscaler
+  - capacity

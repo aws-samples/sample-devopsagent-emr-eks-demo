@@ -1,0 +1,95 @@
+scenario_name: spark-data-skew
+description: >
+  Performance degradation or task failures caused by data skew in Spark jobs.
+  Data skew occurs when partitions have highly uneven sizes, causing some tasks
+  to process significantly more data than others. This leads to long-running
+  straggler tasks, excessive spill to disk, and potential OOM on skewed partitions.
+severity: NON_SEVERE
+symptoms:
+  - "One or more tasks in a stage take significantly longer than the median task duration"
+  - "Spark UI shows highly uneven partition sizes across tasks in a stage"
+  - "Excessive spill to disk (memory and disk spill metrics elevated)"
+  - "Stage completion blocked by a small number of straggler tasks"
+  - "Executor memory warnings on specific executors processing large partitions"
+  - "Job duration exceeds historical average by 2x or more due to slow stages"
+investigation_steps:
+  - step_number: 1
+    description: "Retrieve the EMR job run status to confirm the job is slow or failed due to stage timeouts"
+    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
+    expected_output: "Job state RUNNING with extended duration or FAILED with stage timeout"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 2
+    description: "Check Spark History Server for stage-level task duration distribution to identify skew"
+    command: "get_spark_history_stages({application_id})"
+    expected_output: "Stage details showing max task duration >> median task duration (10x+ ratio indicates skew)"
+    parameters:
+      - application_id
+  - step_number: 3
+    description: "Examine task-level metrics for the slowest stage to identify skewed partitions"
+    command: "get_spark_history_stage_tasks({application_id}, {stage_id})"
+    expected_output: "Task list showing input/output bytes per task — skewed tasks will have 10-100x more data than median"
+    parameters:
+      - application_id
+      - stage_id
+  - step_number: 4
+    description: "Search CloudWatch Logs for spill-to-disk warnings indicating memory pressure from large partitions"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
+      --filter-pattern "\"spill\" OR \"ExternalAppendOnlyMap\" OR \"ExternalSorter\" OR \"disk spill\""
+      --limit 30
+    expected_output: "Log entries showing spill events with bytes spilled to disk per task"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 5
+    description: "Query CloudWatch metrics for shuffle read/write imbalance across executors"
+    command: >
+      get_emr_metrics({virtual_cluster_id},
+      start_time=job_start_time, end_time=current_time)
+    expected_output: "Shuffle metrics showing uneven distribution — some executors with 10x+ shuffle read bytes compared to others"
+    parameters:
+      - virtual_cluster_id
+  - step_number: 6
+    description: "Check the Spark SQL execution plan for join operations that may cause skew"
+    command: "get_spark_history_sql({application_id})"
+    expected_output: "SQL plan showing SortMergeJoin or ShuffledHashJoin on skewed keys"
+    parameters:
+      - application_id
+root_cause_patterns:
+  - "Join key skew — a small number of key values account for a disproportionate share of rows, causing uneven partition sizes after shuffle"
+  - "GroupBy key skew — aggregation on a column with hot keys (e.g., null values, default values) concentrates data in few partitions"
+  - "Uneven input file sizes — source data files have highly variable sizes causing unbalanced initial partitions"
+  - "Hash partitioning collision — poor hash distribution on the partition key leads to uneven bucket sizes"
+  - "Explode or flatMap amplification — array/map explosion on skewed rows creates massive partitions"
+remediation_actions:
+  - "Enable adaptive query execution: set spark.sql.adaptive.enabled=true and spark.sql.adaptive.skewJoin.enabled=true"
+  - "Set skew join threshold: configure spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes=256MB"
+  - "Salt skewed keys: add a random salt column to the skewed join key, perform the join, then aggregate to remove the salt"
+  - "Repartition before joins: use .repartition(N, col) with a higher partition count to spread skewed keys"
+  - "Filter hot keys: process highly skewed keys separately with a broadcast join and union the results"
+  - "Increase partition count: set spark.sql.shuffle.partitions to 2-4x the current value to reduce per-partition size"
+  - "Use broadcast join for small tables: set spark.sql.autoBroadcastJoinThreshold=50MB if one side fits in memory"
+related_metrics:
+  - "ShuffleReadBytes"
+  - "ShuffleWriteBytes"
+  - "SpillMemoryBytes"
+  - "SpillDiskBytes"
+  - "TaskDuration"
+  - "StageCompletionTime"
+log_patterns:
+  - "ExternalAppendOnlyMap"
+  - "ExternalSorter"
+  - "spill.*disk"
+  - "task.*running.*longer"
+  - "skew"
+escalation_contacts:
+  - "data-engineering-team@company.com"
+tags:
+  - data-skew
+  - performance
+  - shuffle
+  - partitioning
+  - straggler

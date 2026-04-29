@@ -1,0 +1,37 @@
+# Environment
+config.env
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AgentCore deploy artifacts (generated at deploy time)
+agentcore/
+.cli/
+
+# TLS certs (generated at deploy time)
+*.pem
+*.key
+spark-history-mcp/shs-mcp-tls.*
+
+# Terraform
+infrastructure/terraform/.terraform/
+infrastructure/terraform/*.tfstate*
+
+# Generated diagram iterations (final diagram is in docs/images/)
+generated-diagrams/
+.kiro/

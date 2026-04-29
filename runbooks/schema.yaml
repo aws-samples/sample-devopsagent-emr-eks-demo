@@ -1,0 +1,105 @@
+# Runbook_Schema — JSON Schema (in YAML format) for Amazon EMR and Apache Spark runbooks.
+# All runbooks in the Runbook_Store must conform to this schema.
+#
+# Dataset compliance:
+#   All runbook content (runbooks/*.yaml) is original synthetic operational
+#   guidance created for this aws-samples repository. Licensed under MIT-0.
+#   Data classification: PUBLIC (no customer data, no proprietary content).
+#   The runbooks are indexed into an Amazon Bedrock Knowledge Base for
+#   semantic search by the Runbook MCP server.
+$schema: "http://json-schema.org/draft-07/schema#"
+title: Runbook
+description: Schema for Amazon EMR and Apache Spark failure scenario runbooks
+type: object
+required:
+  - scenario_name
+  - description
+  - severity
+  - symptoms
+  - investigation_steps
+  - root_cause_patterns
+  - remediation_actions
+properties:
+  scenario_name:
+    type: string
+    description: Unique identifier for the failure scenario
+    minLength: 1
+  description:
+    type: string
+    description: Human-readable description of the failure scenario
+    minLength: 1
+  severity:
+    type: string
+    description: Default severity classification
+    enum:
+      - SEVERE
+      - NON_SEVERE
+  symptoms:
+    type: array
+    description: Observable symptoms for this failure scenario
+    items:
+      type: string
+    minItems: 1
+  investigation_steps:
+    type: array
+    description: Ordered investigation steps
+    items:
+      type: object
+      required:
+        - step_number
+        - description
+      properties:
+        step_number:
+          type: integer
+          description: Step order number
+          minimum: 1
+        description:
+          type: string
+          description: What to do in this step
+          minLength: 1
+        command:
+          type: string
+          description: Parameterized command template (e.g. "get_emr_job_status({job_id})")
+        expected_output:
+          type: string
+          description: What to look for in the output
+        parameters:
+          type: array
+          description: Dynamic value references (e.g. job_id, cluster_id)
+          items:
+            type: string
+      additionalProperties: false
+    minItems: 1
+  root_cause_patterns:
+    type: array
+    description: Known root cause patterns for this scenario
+    items:
+      type: string
+    minItems: 1
+  remediation_actions:
+    type: array
+    description: Remediation steps to resolve the issue
+    items:
+      type: string
+    minItems: 1
+  related_metrics:
+    type: array
+    description: CloudWatch metric names to check
+    items:
+      type: string
+  log_patterns:
+    type: array
+    description: Regex patterns to search in logs
+    items:
+      type: string
+  escalation_contacts:
+    type: array
+    description: Contact info for escalation
+    items:
+      type: string
+  tags:
+    type: array
+    description: Category tags for filtering
+    items:
+      type: string
+additionalProperties: false

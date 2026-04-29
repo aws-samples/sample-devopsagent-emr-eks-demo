@@ -1,0 +1,111 @@
+scenario_name: spark-oom-failure
+description: >
+  Spark job failure due to Out-Of-Memory (OOM) errors in executors or the driver.
+  Covers OOMKilled by Kubernetes (exit code 137), Java heap space exhaustion,
+  and off-heap memory overflow. Common in jobs with large shuffles, broadcasts,
+  or skewed partitions that exceed configured memory limits.
+severity: SEVERE
+symptoms:
+  - "Executor or driver pod terminated with exit code 137 (OOMKilled)"
+  - "java.lang.OutOfMemoryError: Java heap space in executor or driver logs"
+  - "java.lang.OutOfMemoryError: GC overhead limit exceeded"
+  - "Container killed by YARN/Kubernetes for exceeding memory limits"
+  - "SparkException: Job aborted due to stage failure with OOM errors"
+  - "Executor lost with exit code 137 and no heartbeat"
+investigation_steps:
+  - step_number: 1
+    description: "Retrieve the Amazon EMR job run status and check for OOM-related failure reasons"
+    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
+    expected_output: "Job state FAILED with failureReason containing memory or OOM references"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 2
+    description: "Search CloudWatch Logs for OOM error patterns in the Spark driver log group"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
+      --filter-pattern "OutOfMemoryError OR OOMKilled OR \"exit code 137\" OR \"GC overhead limit\""
+      --limit 50
+    expected_output: "Log entries showing OOM errors with timestamps and container identifiers"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 3
+    description: "Retrieve Spark executor and driver logs to identify which component ran out of memory"
+    command: "get_spark_logs({virtual_cluster_id}, {job_id})"
+    expected_output: "Driver or executor logs containing OOM stack traces with memory allocation details"
+    parameters:
+      - virtual_cluster_id
+      - job_id
+  - step_number: 4
+    description: "Check Spark History Server for executor memory usage and peak memory metrics"
+    command: "get_spark_history_executors({application_id})"
+    expected_output: "Executor summary showing memoryUsed vs maxMemory, identifying executors near or at memory limits"
+    parameters:
+      - application_id
+  - step_number: 5
+    description: "Query CloudWatch metrics for container memory utilization trends leading up to the failure"
+    command: >
+      get_emr_metrics({virtual_cluster_id},
+      start_time=failure_time-30m, end_time=failure_time)
+    expected_output: "Memory utilization metrics showing a ramp-up pattern approaching 100% before the OOM event"
+    parameters:
+      - virtual_cluster_id
+  - step_number: 6
+    description: "Check Spark stage details for stages with excessive shuffle read/write or broadcast sizes"
+    command: "get_spark_history_stages({application_id})"
+    expected_output: "Stage metrics showing large shuffle read bytes, broadcast sizes, or spill metrics that correlate with OOM"
+    parameters:
+      - application_id
+  - step_number: 7
+    description: "Review Kubernetes pod events for OOMKilled signals and resource limit enforcement"
+    command: >
+      aws logs filter-log-events
+      --log-group-name /aws/eks/{cluster_id}/cluster
+      --filter-pattern "OOMKilled OR \"memory limit\" OR \"exceeded\" OR \"evicted\""
+      --start-time failure_time_epoch_minus_15m
+      --limit 20
+    expected_output: "Kubernetes events showing pod OOMKilled with container memory limit details"
+    parameters:
+      - cluster_id
+root_cause_patterns:
+  - "Executor heap memory too small for the data volume — spark.executor.memory is undersized relative to partition sizes or cached data"
+  - "Driver OOM due to collecting large datasets — actions like collect(), toPandas(), or broadcast joins pulling too much data to the driver"
+  - "Off-heap memory exhaustion from large shuffle operations — shuffle buffers and sort spill exceed spark.memory.offHeap.size"
+  - "Memory leak in user-defined functions (UDFs) or accumulators retaining references across tasks"
+  - "Data skew causing a single executor to process a disproportionately large partition"
+  - "Broadcast variable too large for driver memory — broadcast join threshold (spark.sql.autoBroadcastJoinThreshold) set too high"
+  - "Kubernetes memory limit set lower than total Spark memory (heap + overhead) — spark.kubernetes.memoryOverheadFactor too low"
+remediation_actions:
+  - "Increase executor memory: set spark.executor.memory to 2-4x current value and resubmit the job"
+  - "Increase driver memory: set spark.driver.memory if driver OOM, especially for collect/broadcast operations"
+  - "Adjust memory overhead: set spark.kubernetes.memoryOverheadFactor to 0.4 or higher for memory-intensive workloads"
+  - "Repartition data: add .repartition(N) before large shuffles to reduce per-partition memory pressure"
+  - "Reduce broadcast threshold: lower spark.sql.autoBroadcastJoinThreshold to 10MB or disable with -1"
+  - "Enable adaptive query execution: set spark.sql.adaptive.enabled=true to auto-optimize partition sizes"
+  - "Replace collect() with write operations — avoid pulling large datasets to the driver"
+  - "Enable off-heap memory: set spark.memory.offHeap.enabled=true and spark.memory.offHeap.size for shuffle-heavy jobs"
+related_metrics:
+  - "ContainerMemoryUtilization"
+  - "ExecutorMemoryUsed"
+  - "JVMHeapUsage"
+  - "GCTimeMillis"
+  - "ShuffleSpillBytes"
+log_patterns:
+  - "java\\.lang\\.OutOfMemoryError"
+  - "exit code 137"
+  - "OOMKilled"
+  - "GC overhead limit exceeded"
+  - "Container killed.*memory"
+  - "ExecutorLostFailure.*exit code 137"
+escalation_contacts:
+  - "emr-platform-team@company.com"
+  - "spark-oncall@company.com"
+tags:
+  - memory
+  - oom
+  - executor
+  - driver
+  - kubernetes
+  - heap

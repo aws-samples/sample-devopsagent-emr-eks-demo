@@ -1,0 +1,106 @@
+# =============================================================================
+# Helm values for SHS MCP — deployed on Amazon EKS, exposed via internal NLB
+#
+# Data classification: Spark job metadata (stages, tasks, executors, shuffle
+# metrics). Sensitivity: LOW — operational metadata, no customer PII.
+#
+# Encryption at rest: this pod has no persistent volumes. Spark event logs
+# are stored in Amazon S3 (SSE-S3 AES-256, configured in infrastructure/template.yaml).
+# Kubernetes Secrets (API key, TLS cert) are etcd-encrypted by Amazon EKS.
+#
+# Encryption in transit: external traffic is TLS-encrypted via nginx sidecar
+# (port 18889). Internal pod-to-pod traffic uses HTTP (SHS limitation).
+#
+# Access logging: NLB access logs can be enabled via the
+# service.beta.kubernetes.io/aws-load-balancer-access-log-enabled annotation.
+# Not enabled by default in this sample (short-lived demo).
+#
+# Key management: see docs/SECURITY_CONSIDERATIONS.md for rotation schedules.
+#
+# DevOps Agent connects via Private Connection (Amazon VPC Lattice) → internal NLB.
+# No public internet exposure.
+#
+# Usage:
+#   helm install shs-mcp kubeflow/mcp-apache-spark-history-server \
+#     -n spark-history -f spark-history-mcp/helm-values.yaml
+# =============================================================================
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/kubeflow/mcp-apache-spark-history-server
+  tag: "0.1.5"
+  pullPolicy: IfNotPresent
+
+# Internal NLB — private, no internet exposure
+# DevOps Agent reaches this via Private Connection (VPC Lattice)
+service:
+  type: LoadBalancer
+  port: 18888
+  targetPort: http
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    # To enable NLB access logs (P2 — recommended for production):
+    # 1. Create an S3 bucket with appropriate policies (see AWS docs link below)
+    # 2. Uncomment and set the annotations below:
+    # service.beta.kubernetes.io/aws-load-balancer-access-log-enabled: "true"
+    # service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-name: "<your-log-bucket>"
+    # service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-prefix: "shs-mcp-nlb"
+    # Docs: https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-access-logs.html
+
+# SHS MCP config — points to the SHS ClusterIP service in the same namespace.
+# Internal HTTP is used for pod-to-pod communication within the EKS cluster
+# (svc.cluster.local). Apache Spark History Server does not natively support TLS.
+# External traffic is encrypted: the nginx sidecar (added by deploy-shs-mcp-private.sh)
+# terminates TLS on port 18889 before proxying to this internal HTTP endpoint.
+config:
+  port: 18888
+  debug: false
+  servers:
+    default:
+      default: true
+      url: "http://spark-history-server.spark-history.svc.cluster.local:18080"
+
+# Right-sized for demo workloads
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+
+# Single replica is fine for demo
+autoscaling:
+  enabled: false
+
+# Labels for DevOps Agent resource discovery
+podLabels:
+  devopsagent: "true"
+
+# Override health checks — use TCP socket since MCP endpoints expect POST not GET
+livenessProbe:
+  httpGet: null
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet: null
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+
+startupProbe:
+  httpGet: null
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 12

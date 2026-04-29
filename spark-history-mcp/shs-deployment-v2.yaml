@@ -1,0 +1,99 @@
+# =============================================================================
+# Spark History Server — Kubernetes Deployment (with S3 support)
+#
+# Deploys SHS on EKS that reads event logs from S3.
+# Init container downloads hadoop-aws + aws-java-sdk JARs needed for S3A.
+#
+# Usage:
+#   export S3_BUCKET=dev-emr-spark-<account-id>
+#   sed "s|S3_BUCKET_PLACEHOLDER|$S3_BUCKET|g" \
+#     spark-history-mcp/shs-deployment-v2.yaml | kubectl apply -f -
+#
+# Prerequisites:
+#   - EKS cluster with kubectl configured
+#   - S3 bucket with spark-events/ prefix
+#   - Node role with S3 read access to the bucket
+#   - Outbound internet (for init container JAR download + image pull)
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark-history
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-history-server
+  namespace: spark-history
+  labels:
+    app: spark-history-server
+    devopsagent: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-history-server
+  template:
+    metadata:
+      labels:
+        app: spark-history-server
+    spec:
+      initContainers:
+        - name: download-hadoop-jars
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              wget -q -P /jars https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar
+              wget -q -P /jars https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar
+              ls -la /jars/
+          volumeMounts:
+            - name: hadoop-jars
+              mountPath: /jars
+      containers:
+        - name: spark-history-server
+          image: apache/spark:3.5.3
+          command:
+            - /bin/bash
+            - -c
+            - |
+              cp /extra-jars/*.jar /opt/spark/jars/
+              /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+          ports:
+            - containerPort: 18080
+          env:
+            - name: SPARK_HISTORY_OPTS
+              value: >-
+                -Dspark.history.fs.logDirectory=s3a://S3_BUCKET_PLACEHOLDER/spark-events/
+                -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+                -Dspark.hadoop.fs.s3a.aws.credentials.provider=com.amazonaws.auth.DefaultAWSCredentialsProviderChain
+          volumeMounts:
+            - name: hadoop-jars
+              mountPath: /extra-jars
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+      volumes:
+        - name: hadoop-jars
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-history-server
+  namespace: spark-history
+  labels:
+    app: spark-history-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 18080
+      targetPort: 18080
+      protocol: TCP
+  selector:
+    app: spark-history-server
