@@ -224,7 +224,7 @@ Verify Amazon Bedrock Knowledge Base returns runbooks:
 
 ```bash
 KB_ID=$(aws bedrock-agent list-knowledge-bases --region $AWS_REGION \
-  --query "knowledgeBaseSummaries[?name=='dev-emr-runbooks-kb'].knowledgeBaseId" --output text)
+  --query "knowledgeBaseSummaries[?starts_with(name,'dev-emr-runbooks-kb') && status=='ACTIVE'].knowledgeBaseId" --output text)
 aws bedrock-agent-runtime retrieve --knowledge-base-id "$KB_ID" --region $AWS_REGION \
   --retrieval-query '{"text": "spark OOM failure"}' \
   --query "retrievalResults[0].content.text" --output text | head -5

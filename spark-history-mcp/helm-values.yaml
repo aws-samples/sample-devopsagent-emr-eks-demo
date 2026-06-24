@@ -56,8 +56,11 @@ service:
 # External traffic is encrypted: the nginx sidecar (added by deploy-shs-mcp-private.sh)
 # terminates TLS on port 18889 before proxying to this internal HTTP endpoint.
 config:
+  transports:
+    - streamable-http
   port: 18888
   debug: false
+  address: 0.0.0.0
   servers:
     default:
       default: true

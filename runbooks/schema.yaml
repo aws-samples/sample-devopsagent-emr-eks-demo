@@ -1,15 +1,15 @@
-# Runbook_Schema — JSON Schema (in YAML format) for Amazon EMR and Apache Spark runbooks.
-# All runbooks in the Runbook_Store must conform to this schema.
+# Runbook Schema — for Amazon EMR on Amazon EKS and Apache Spark runbooks.
+# All runbooks in the runbooks/ directory must conform to this schema.
 #
 # Dataset compliance:
-#   All runbook content (runbooks/*.yaml) is original synthetic operational
-#   guidance created for this aws-samples repository. Licensed under MIT-0.
+#   All runbook content is original synthetic operational guidance created
+#   for this aws-samples repository. Licensed under MIT-0.
 #   Data classification: PUBLIC (no customer data, no proprietary content).
 #   The runbooks are indexed into an Amazon Bedrock Knowledge Base for
 #   semantic search by the Runbook MCP server.
 $schema: "http://json-schema.org/draft-07/schema#"
 title: Runbook
-description: Schema for Amazon EMR and Apache Spark failure scenario runbooks
+description: Schema for Amazon EMR on Amazon EKS and Apache Spark failure scenario runbooks
 type: object
 required:
   - scenario_name
@@ -42,7 +42,7 @@ properties:
     minItems: 1
   investigation_steps:
     type: array
-    description: Ordered investigation steps
+    description: Ordered investigation steps (generic guidance, not prescriptive commands)
     items:
       type: object
       required:
@@ -55,19 +55,11 @@ properties:
           minimum: 1
         description:
           type: string
-          description: What to do in this step
+          description: What to investigate in this step
           minLength: 1
-        command:
-          type: string
-          description: Parameterized command template (e.g. "get_emr_job_status({job_id})")
         expected_output:
           type: string
-          description: What to look for in the output
-        parameters:
-          type: array
-          description: Dynamic value references (e.g. job_id, cluster_id)
-          items:
-            type: string
+          description: What findings indicate for this scenario
       additionalProperties: false
     minItems: 1
   root_cause_patterns:
@@ -78,23 +70,18 @@ properties:
     minItems: 1
   remediation_actions:
     type: array
-    description: Remediation steps to resolve the issue
+    description: General remediation guidance (not prescriptive configuration values)
     items:
       type: string
     minItems: 1
   related_metrics:
     type: array
-    description: CloudWatch metric names to check
+    description: Relevant metric names to check
     items:
       type: string
   log_patterns:
     type: array
     description: Regex patterns to search in logs
-    items:
-      type: string
-  escalation_contacts:
-    type: array
-    description: Contact info for escalation
     items:
       type: string
   tags:

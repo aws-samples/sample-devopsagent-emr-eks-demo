@@ -84,6 +84,20 @@ helm upgrade --install shs-mcp "$CHART_SOURCE" \
 
 ok "SHS MCP deployed via Helm"
 
+# Fix: upstream chart generates 'transport' (singular) but image 0.1.5 expects 'transports' (list)
+kubectl create configmap shs-mcp-mcp-apache-spark-history-server-config \
+  --from-literal=config.yaml='mcp:
+  transports:
+    - streamable-http
+  port: "18888"
+  debug: false
+  address: 0.0.0.0
+servers:
+  default:
+    default: true
+    url: "http://spark-history-server.spark-history.svc.cluster.local:18080"
+' --namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
 # ── Step 2: Generate TLS cert + K8s secrets ───────────────────────────────
 info "Step 2/7: Setting up TLS + API key secrets ..."
 

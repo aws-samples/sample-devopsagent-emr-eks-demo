@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Amazon EMR Spark Alert Reduction — DevOps Agent layer.
-  Deploys Amazon S3 runbook store (with access logging + HTTPS-only policy)
-  and Amazon OpenSearch Serverless vector store.
-  Amazon Bedrock Knowledge Base is created post-deploy via the deploy script.
+  Deploys Amazon S3 runbook store (HTTPS-only policy).
+  Amazon Bedrock Knowledge Base (with managed vector store) is created
+  post-deploy via the deploy script.
 
 Parameters:
   EnvironmentName:
@@ -13,73 +13,8 @@ Parameters:
 
 Resources:
 
-  # S3 Bucket — stores server access logs for DataBucket.
-  # Hardened: block public access, AES-256 SSE, log delivery ACL for S3 logging,
-  # self-referencing LoggingConfiguration (logs bucket logs to itself), and
-  # an HTTPS-only bucket policy matching the DataBucket policy.
-  LoggingBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "${EnvironmentName}-emr-spark-${AWS::AccountId}-access-logs"
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: ObjectWriter
-      AccessControl: LogDeliveryWrite
-      # Self-logging enabled with versioning. Lifecycle rule expires noncurrent
-      # versions after 1 day to prevent version explosion from self-logging writes.
-      VersioningConfiguration:
-        Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpireOldVersions
-            Status: Enabled
-            NoncurrentVersionExpiration:
-              NoncurrentDays: 1
-      LoggingConfiguration:
-        LogFilePrefix: "logging-bucket-access-logs/"
-      Tags:
-        - Key: Environment
-          Value: !Ref EnvironmentName
-        - Key: devopsagent
-          Value: "true"
-
-  # Enforce HTTPS (TLS) for all requests to LoggingBucket.
-  LoggingBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref LoggingBucket
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          # Note: Action "s3:*" in a Deny statement is the AWS-recommended pattern
-          # for HTTPS enforcement (see https://repost.aws/knowledge-center/s3-bucket-policy-for-config-rule).
-          # This does NOT grant s3:* — it denies all S3 actions over non-HTTPS.
-          - Sid: DenyInsecureTransport
-            Effect: Deny
-            Principal: "*"
-            Action: "s3:*"
-            Resource: "*"
-            Condition:
-              Bool:
-                "aws:SecureTransport": false
-
   # S3 Bucket — runbooks + Spark event logs.
-  # MFA Delete: cannot be enabled via CloudFormation — requires root account user
-  # with MFA via AWS CLI. For production, enable post-deploy:
-  #   aws s3api put-bucket-versioning --bucket <name> \
-  #     --versioning-configuration Status=Enabled,MFADelete=Enabled \
-  #     --mfa "<mfa-serial> <mfa-code>"
-  # Same applies to LoggingBucket above.
-  # Hardened: BPA, SSE-S3 (AES-256), server access logging, HTTPS-only bucket policy.
+  # Hardened: BPA, SSE-S3 (AES-256), HTTPS-only bucket policy.
   DataBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -89,15 +24,10 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      VersioningConfiguration:
-        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
-      LoggingConfiguration:
-        DestinationBucketName: !Ref LoggingBucket
-        LogFilePrefix: "data-bucket-access-logs/"
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -112,29 +42,19 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          # Note: Action "s3:*" in a Deny statement is the AWS-recommended pattern
-          # for HTTPS enforcement. This does NOT grant s3:* — it denies all S3
-          # actions over non-HTTPS.
           - Sid: DenyInsecureTransport
             Effect: Deny
             Principal: "*"
             Action: "s3:*"
-            Resource: "*"
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
             Condition:
               Bool:
-                "aws:SecureTransport": false
+                "aws:SecureTransport": "false"
 
   # IAM Role for Amazon Bedrock Knowledge Base.
-  #
-  # Security responsibility: this role grants the Amazon Bedrock service read
-  # access to the runbook bucket, invoke rights on the Titan embedding model,
-  # and scoped Amazon OpenSearch Serverless index access. AWS manages the
-  # Amazon Bedrock and AWS IAM services. You are responsible for:
-  #   1. Reviewing these policies periodically and removing unused actions
-  #      (see "IAM access review" in README).
-  #   2. Monitoring CloudTrail for unexpected principals assuming this role.
-  #   3. Keeping the DataBucket bucket policy consistent with these permissions.
-  #   4. Deleting the role when the stack is torn down (handled by destroy.sh).
+  # Grants Bedrock service read access to runbooks in S3 and model invocation.
   KBRole:
     Type: AWS::IAM::Role
     Properties:
@@ -169,25 +89,14 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: aoss:APIAccessAll
-                # Resource scoped by collection name (avoids circular ref with AossCollection).
-                # AOSS ARN format: arn:aws:aoss:<region>:<account>:collection/<collection-id>
-                # Using a wildcard on collection-id is acceptable here because the AWS account
-                # condition below restricts access to this account only.
-                # Note: aoss:APIAccessAll is the only valid IAM action for AOSS data-plane
-                # access. Granular actions (CreateIndex, ReadDocument, etc.) are only valid
-                # in AOSS data access policies, not in IAM policies.
+                # Scoped to this account's AOSS collections. The data access policy
+                # (AossDataAccessPolicy) further restricts to the specific collection.
                 Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
                 Condition:
                   StringEquals:
                     aws:PrincipalAccount: !Ref "AWS::AccountId"
 
-  # Amazon OpenSearch Serverless — vector store for Amazon Bedrock Knowledge Base
-  #
-  # Encryption: uses AWS-owned key (AWSOwnedKey:true). This is the default AOSS
-  # encryption and is acceptable for this sample: data is non-sensitive runbook
-  # text and vector embeddings. For workloads with customer-managed key
-  # requirements (FIPS, compliance), replace with a KMS CMK ARN:
-  #   '{"Rules":[...],"KmsARN":"arn:aws:kms:<region>:<account>:key/<id>"}'
+  # Amazon OpenSearch Serverless — vector store for the Bedrock Knowledge Base.
   AossEncryptionPolicy:
     Type: AWS::OpenSearchServerless::SecurityPolicy
     Properties:
@@ -195,10 +104,12 @@ Resources:
       Type: encryption
       Policy: !Sub '{"Rules":[{"ResourceType":"collection","Resource":["collection/${EnvironmentName}-emr-kb"]}],"AWSOwnedKey":true}'
 
-  # Network policy: AllowFromPublic=true permits the control plane to reach
-  # the collection from outside the VPC. Acceptable for the sample's walkthrough.
-  # For production: set AllowFromPublic=false and add a VPC endpoint. See
-  # https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-vpc.html
+  # Network policy — DEPLOY-TIME state:
+  #   collection + dashboard: public, so the deploy script's awscurl can create
+  #   the vector index (index API uses the collection data-plane endpoint).
+  #   Bedrock service access is also granted for runtime queries.
+  # After index creation, deploy-infra.sh flips this to AllowFromPublic:false
+  # (Bedrock service access only) so there is no standing public access.
   AossNetworkPolicy:
     Type: AWS::OpenSearchServerless::SecurityPolicy
     Properties:
@@ -231,8 +142,6 @@ Resources:
 Outputs:
   DataBucketName:
     Value: !Ref DataBucket
-  LoggingBucketName:
-    Value: !Ref LoggingBucket
   KBRoleArn:
     Value: !GetAtt KBRole.Arn
   AossCollectionArn:

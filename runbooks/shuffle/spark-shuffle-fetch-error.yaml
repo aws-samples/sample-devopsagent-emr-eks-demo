@@ -1,108 +1,70 @@
 scenario_name: spark-shuffle-fetch-error
 description: >
-  Spark stage failure caused by shuffle fetch errors. Occurs when a reducer task
-  cannot read shuffle data from a mapper task's output. Common causes include
-  executor loss during shuffle, network connectivity issues, shuffle service
-  unavailability, and corrupted shuffle files on local disk.
+  Investigation procedure for Spark stage failures caused by shuffle fetch errors.
+  Occurs when reducer tasks cannot read shuffle output from mapper tasks.
 severity: SEVERE
-symptoms:
-  - "FetchFailedException: Failed to connect to host or fetch shuffle data"
-  - "org.apache.spark.shuffle.FetchFailedException in task logs"
-  - "Connection refused or connection reset when fetching shuffle blocks"
-  - "Shuffle service unavailable or not responding on executor"
-  - "RetryingBlockFetcher: Exception while beginning fetch of shuffle blocks"
-  - "Stage retry due to fetch failures exceeding spark.shuffle.io.maxRetries"
+data_sources:
+  shs: "Spark History Server MCP — stage attempts, shuffle metrics, executor lifecycle"
+  cloudwatch_logs: "CloudWatch log group /emr-on-eks/<env> — FetchFailedException stack traces, executor logs"
+  eks: "Kubernetes pod events, termination status, node conditions in namespace emr-data-team-a"
+  cloudwatch_metrics: "AWS/EMRContainers namespace — job state transitions"
 investigation_steps:
   - step_number: 1
-    description: "Retrieve the Amazon EMR job run status and identify the failed stage with shuffle errors"
-    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
-    expected_output: "Job state FAILED with failureReason referencing FetchFailedException or shuffle fetch error"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Identify the failed application and stage"
+    sources: ["shs"]
+    shs_tool: "get_application_list"
+    what_to_look_for: "Find the failed app. Note application ID."
   - step_number: 2
-    description: "Search CloudWatch Logs for FetchFailedException and shuffle-related error patterns"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
-      --filter-pattern "\"FetchFailedException\" OR \"shuffle\" AND (\"failed\" OR \"error\" OR \"refused\")"
-      --limit 50
-    expected_output: "Log entries showing which shuffle blocks failed, source executor, and error details"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Identify which stage failed and how many attempts it made"
+    sources: ["shs"]
+    shs_tool: "get_stage_list"
+    what_to_look_for: "Stages with multiple attempts or FAILED status. Multiple attempts suggest transient fetch failures."
   - step_number: 3
-    description: "Retrieve Spark logs to identify the specific executors and stages involved in shuffle failures"
-    command: "get_spark_logs({virtual_cluster_id}, {job_id})"
-    expected_output: "Executor logs showing shuffle write/read errors and driver logs showing stage retry attempts"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Examine shuffle metrics on the failed stage"
+    sources: ["shs"]
+    shs_tool: "get_stage_details"
+    what_to_look_for: "shuffleReadBytes, shuffleWriteBytes, shuffleFetchWaitTime. Compare the failed stage attempt vs any successful prior stages."
   - step_number: 4
-    description: "Check Spark History Server for stage attempts and shuffle read/write metrics"
-    command: "get_spark_history_stages({application_id})"
-    expected_output: "Stage details showing multiple attempts, shuffle read failures, and which tasks failed with fetch errors"
-    parameters:
-      - application_id
+    action: "Check executor lifecycle"
+    sources: ["shs"]
+    shs_tool: "get_executor_list"
+    what_to_look_for: "Were any executors removed between the shuffle write stage and the shuffle read stage? Note their removal time and reason."
   - step_number: 5
-    description: "Check executor status to determine if the shuffle data source executor was lost"
-    command: "get_spark_history_executors({application_id})"
-    expected_output: "Executor list showing if the source executor for failed shuffle blocks was removed or dead"
-    parameters:
-      - application_id
+    action: "Search logs for fetch failure details"
+    sources: ["cloudwatch_logs"]
+    log_group: "/emr-on-eks/<env>"
+    what_to_look_for: "FetchFailedException messages — note which executor was the source, what block was requested, and the connection error type."
   - step_number: 6
-    description: "Query CloudWatch metrics for network errors and disk I/O during the failure window"
-    command: >
-      get_emr_metrics({virtual_cluster_id},
-      start_time=failure_time-15m, end_time=failure_time+5m)
-    expected_output: "Network error metrics or disk I/O spikes correlating with shuffle fetch failures"
-    parameters:
-      - virtual_cluster_id
+    action: "Check Kubernetes pod status for the source executor"
+    sources: ["eks"]
+    what_to_look_for: "Was the source executor pod terminated, evicted, or restarted between shuffle write and read? Check pod events and termination reason."
   - step_number: 7
-    description: "Check for disk space issues on executor nodes that may have caused shuffle file corruption"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
-      --filter-pattern "\"No space left\" OR \"disk\" AND \"full\" OR \"IOException\" AND \"shuffle\""
-      --limit 20
-    expected_output: "Log entries indicating disk space exhaustion or I/O errors on shuffle data directories"
-    parameters:
-      - virtual_cluster_id
-      - job_id
-root_cause_patterns:
-  - "Source executor lost — the executor that wrote shuffle data was killed or evicted before the reducer could fetch it"
-  - "Network connectivity issue — transient network partition or DNS resolution failure between executor pods"
-  - "Shuffle service port blocked — Kubernetes NetworkPolicy or security group blocking the shuffle service port (default 7337)"
-  - "Local disk full — shuffle data directory ran out of space causing write failures and corrupted shuffle files"
-  - "Shuffle file corruption — incomplete or corrupted shuffle output files due to executor crash during shuffle write"
-  - "Too many concurrent connections — shuffle service overwhelmed by too many simultaneous fetch requests"
-remediation_actions:
-  - "Increase shuffle retries: set spark.shuffle.io.maxRetries=10 and spark.shuffle.io.retryWait=10s"
-  - "Enable external shuffle service: deploy the Spark external shuffle service on Amazon EKS to preserve shuffle data across executor lifecycle"
-  - "Increase local disk: use larger EBS volumes or NVMe instance store for shuffle data directories"
-  - "Reduce shuffle data: add .coalesce() or .repartition() to reduce the number of shuffle partitions"
-  - "Enable shuffle compression: set spark.shuffle.compress=true and spark.io.compression.codec=lz4"
-  - "Check network policies: ensure Kubernetes NetworkPolicies allow traffic on shuffle service port between executor pods"
-  - "Enable push-based shuffle: set spark.shuffle.push.enabled=true for Spark 3.2+ to improve shuffle reliability"
-  - "Increase executor memory to reduce spill: larger executors can hold more shuffle data in memory"
-related_metrics:
-  - "ShuffleReadBytes"
-  - "ShuffleWriteBytes"
-  - "ShuffleFetchWaitTime"
-  - "NetworkErrorCount"
-  - "DiskUtilization"
-  - "TaskFailureCount"
-log_patterns:
-  - "FetchFailedException"
-  - "shuffle.*fetch.*failed"
-  - "Connection refused"
-  - "Connection reset"
-  - "RetryingBlockFetcher"
-  - "No space left on device"
-  - "shuffle.*corrupt"
-escalation_contacts:
-  - "emr-platform-team@company.com"
-  - "eks-infrastructure-team@company.com"
+    action: "Check for disk or network issues"
+    sources: ["cloudwatch_logs", "eks"]
+    what_to_look_for: "Messages about disk full, I/O errors, connection refused, or connection reset. Check if node-level issues affected multiple pods."
+  - step_number: 8
+    action: "Correlate findings"
+    sources: ["shs", "cloudwatch_logs", "eks"]
+    what_to_look_for: >
+      Does the executor removal time match the fetch failure time?
+      Was it a single executor or multiple? Single executor loss points to pod-level issue;
+      multiple points to node-level or network issue.
+platform_notes:
+  - "EMR on EKS does not run an external shuffle service by default. Shuffle data lives on the executor pod — if the pod dies, shuffle data is lost."
+  - "Karpenter may terminate nodes for consolidation. If the source executor was on a consolidated node, shuffle data is lost."
+  - "Spark retries fetch failures up to spark.shuffle.io.maxRetries times. Check if retries were exhausted."
+  - "Network policies in EKS can block executor-to-executor traffic on the shuffle service port."
+remediation:
+  executor_stability:
+    - "Increase executor memory/resources to prevent OOM-induced pod termination"
+    - "Configure pod disruption budgets to protect executor pods during node maintenance"
+  retry_tuning:
+    - "Increase spark.shuffle.io.maxRetries and spark.shuffle.io.retryWait"
+    - "Increase spark.stage.maxConsecutiveAttempts for transient failures"
+  infrastructure:
+    - "Deploy external shuffle service to decouple shuffle data from executor lifecycle"
+    - "Verify network policies allow traffic between executor pods"
+    - "Increase local disk capacity for shuffle-heavy workloads"
 tags:
   - shuffle
   - fetch-failure

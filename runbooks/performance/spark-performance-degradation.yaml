@@ -1,115 +1,76 @@
 scenario_name: spark-performance-degradation
 description: >
-  Spark job performance degradation without outright failure. The job completes
-  but takes significantly longer than expected. Covers slow stages due to
-  suboptimal parallelism, excessive garbage collection pressure, storage spills
-  from insufficient memory, and inefficient query plans.
+  Investigation procedure for Spark jobs that complete but take significantly longer
+  than expected due to suboptimal execution.
 severity: NON_SEVERE
-symptoms:
-  - "Job duration exceeds 2x the historical average for the same job"
-  - "Stages with high GC time relative to task execution time (>20% GC overhead)"
-  - "Excessive spill to disk — memory spill and disk spill metrics elevated"
-  - "Low task parallelism — fewer active tasks than available executor cores"
-  - "Spark UI shows stages with long tail latency (straggler tasks)"
-  - "Shuffle read/write times dominate stage execution time"
-  - "Frequent full GC pauses visible in executor GC logs"
+data_sources:
+  shs: "Spark History Server MCP — stage durations, task metrics, executor GC time, shuffle and spill statistics"
+  cloudwatch_logs: "CloudWatch log group /emr-on-eks/<env> — GC logs, spill warnings"
+  eks: "Kubernetes pod resource usage in namespace emr-data-team-a"
+  cloudwatch_metrics: "AWS/EMRContainers namespace — job duration compared to historical"
 investigation_steps:
   - step_number: 1
-    description: "Retrieve the EMR job run status and compare duration against historical baselines"
-    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
-    expected_output: "Job state COMPLETED or RUNNING with duration significantly exceeding the expected baseline"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Identify the slow application"
+    sources: ["shs"]
+    shs_tool: "get_application_list"
+    what_to_look_for: "Find the app by name or time window. Note total duration vs expected baseline."
   - step_number: 2
-    description: "Check Spark History Server for overall job timeline and identify the slowest stages"
-    command: "get_spark_history_stages({application_id})"
-    expected_output: "Stage list with duration, task counts, and I/O metrics — identify stages taking disproportionate time"
-    parameters:
-      - application_id
+    action: "Identify the slowest stages"
+    sources: ["shs"]
+    shs_tool: "get_stage_list"
+    what_to_look_for: "Which stages consumed the most time? Are there stages that took disproportionately long relative to their data volume?"
   - step_number: 3
-    description: "Examine executor-level GC metrics to identify garbage collection pressure"
-    command: "get_spark_history_executors({application_id})"
-    expected_output: "Executor summary showing totalGCTime vs totalDuration — GC time >20% of total indicates GC pressure"
-    parameters:
-      - application_id
+    action: "Examine stage details for the slowest stage"
+    sources: ["shs"]
+    shs_tool: "get_stage_details"
+    what_to_look_for: "shuffleReadBytes, shuffleWriteBytes, memoryBytesSpilled, diskBytesSpilled, executorRunTime, jvmGCTime. Compare GC time to total executor time — ratio above 20% indicates GC pressure."
   - step_number: 4
-    description: "Search CloudWatch Logs for GC pause warnings and memory pressure indicators"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
-      --filter-pattern "\"GC\" OR \"garbage collection\" OR \"pause\" OR \"Full GC\" OR \"G1 Evacuation Pause\""
-      --limit 30
-    expected_output: "GC log entries showing pause durations, frequency, and heap utilization before/after collection"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Analyze task distribution for straggler detection"
+    sources: ["shs"]
+    shs_tool: "get_stage_task_list"
+    what_to_look_for: "Compare max vs median duration and inputSize. High variance indicates stragglers from skew or resource contention."
   - step_number: 5
-    description: "Check Spark SQL execution plan for inefficient operations (cartesian joins, full table scans)"
-    command: "get_spark_history_sql({application_id})"
-    expected_output: "SQL plan showing BroadcastNestedLoopJoin, CartesianProduct, or missing predicate pushdown"
-    parameters:
-      - application_id
+    action: "Check executor-level GC and resource usage"
+    sources: ["shs"]
+    shs_tool: "get_executor_list"
+    what_to_look_for: "totalGCTime vs totalDuration per executor. Are some executors spending much more time in GC?"
   - step_number: 6
-    description: "Query CloudWatch metrics for CPU utilization and task throughput trends"
-    command: >
-      get_emr_metrics({virtual_cluster_id},
-      start_time=job_start_time, end_time=current_time)
-    expected_output: "CPU utilization patterns — low CPU with high duration suggests I/O bottleneck or insufficient parallelism"
-    parameters:
-      - virtual_cluster_id
+    action: "Check Spark configuration"
+    sources: ["shs"]
+    shs_tool: "get_application_environment"
+    what_to_look_for: "spark.sql.shuffle.partitions, spark.sql.adaptive.enabled, spark.executor.memory, spark.executor.cores. Are these appropriate for the data volume?"
   - step_number: 7
-    description: "Check for storage spill metrics indicating insufficient executor memory for in-memory operations"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
-      --filter-pattern "\"spill\" OR \"ExternalAppendOnlyMap\" OR \"bytes spilled\" OR \"disk spill\""
-      --limit 20
-    expected_output: "Spill events showing bytes spilled to disk — high spill indicates memory pressure"
-    parameters:
-      - virtual_cluster_id
-      - job_id
-root_cause_patterns:
-  - "Insufficient parallelism — spark.sql.shuffle.partitions too low for the data volume, leaving executor cores idle"
-  - "GC pressure from large heap — executor heap too large (>8GB) causing long Full GC pauses with default GC settings"
-  - "Storage spill due to undersized executors — in-memory operations (sorts, aggregations) exceed execution memory fraction"
-  - "Inefficient query plan — missing predicate pushdown, unnecessary shuffles, or suboptimal join strategy"
-  - "Small file problem — reading thousands of small files causes excessive task scheduling overhead"
-  - "Serialization overhead — using Java serialization instead of Kryo for large object transfers"
-  - "Excessive driver overhead — driver spending time on scheduling rather than computation due to too many tasks"
-remediation_actions:
-  - "Increase parallelism: set spark.sql.shuffle.partitions to 2-4x the number of executor cores"
-  - "Tune GC: use G1GC with -XX:+UseG1GC -XX:InitiatingHeapOccupancyPercent=35 for large heaps"
-  - "Increase executor memory fraction: set spark.memory.fraction=0.8 for memory-intensive operations"
-  - "Enable adaptive query execution: set spark.sql.adaptive.enabled=true for automatic partition coalescing"
-  - "Compact small files: pre-process input data to merge small files into larger Parquet files (128-256MB each)"
-  - "Use Kryo serialization: set spark.serializer=org.apache.spark.serializer.KryoSerializer"
-  - "Optimize joins: ensure predicate pushdown is enabled and use broadcast joins for small dimension tables"
-  - "Right-size executors: use 4-5 cores per executor with 4-8GB memory for balanced GC and parallelism"
-  - "Enable speculative execution: set spark.speculation=true to re-launch slow straggler tasks"
-related_metrics:
-  - "JobDuration"
-  - "GCTimeMillis"
-  - "CPUUtilization"
-  - "SpillMemoryBytes"
-  - "SpillDiskBytes"
-  - "TaskCompletionRate"
-  - "ShuffleReadBytes"
-  - "ShuffleWriteBytes"
-log_patterns:
-  - "Full GC"
-  - "G1 Evacuation Pause"
-  - "GC.*pause"
-  - "spill.*disk"
-  - "ExternalAppendOnlyMap"
-  - "task.*slow"
-  - "speculation"
-escalation_contacts:
-  - "data-engineering-team@company.com"
+    action: "Search logs for GC or spill warnings"
+    sources: ["cloudwatch_logs"]
+    log_group: "/emr-on-eks/<env>"
+    what_to_look_for: "Full GC events, long pause warnings, or spill-to-disk messages."
+  - step_number: 8
+    action: "Correlate findings"
+    sources: ["shs", "cloudwatch_logs"]
+    what_to_look_for: >
+      Determine the primary bottleneck: GC pressure, data skew stragglers, insufficient parallelism
+      (too few partitions for available cores), excessive shuffle, or spill overhead.
+platform_notes:
+  - "EMR on EKS defaults spark.sql.shuffle.partitions to 200. For large datasets this may be too low, causing large partitions and spill."
+  - "AQE (spark.sql.adaptive.enabled) auto-coalesces partitions and handles skew — if disabled, check if enabling it resolves the issue."
+  - "Performance issues don't produce error logs. SHS task and stage metrics are the primary diagnostic signal."
+  - "Compare against a known-good run of the same job if available in SHS history."
+remediation:
+  parallelism:
+    - "Increase spark.sql.shuffle.partitions relative to data volume and executor cores"
+    - "Enable AQE for automatic partition coalescing"
+  gc_pressure:
+    - "Increase executor memory to reduce GC frequency"
+    - "Consider more executors with less memory each for better GC characteristics"
+  spill:
+    - "Increase spark.memory.fraction to give more memory to execution"
+    - "Increase executor memory to avoid spill"
+  stragglers:
+    - "Enable speculative execution: spark.speculation=true"
+    - "If caused by skew, enable AQE skew join optimization"
 tags:
   - performance
   - gc-pressure
   - spill
   - parallelism
   - slow-stages
-  - optimization

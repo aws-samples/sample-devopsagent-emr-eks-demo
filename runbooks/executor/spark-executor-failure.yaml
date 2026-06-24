@@ -1,119 +1,71 @@
 scenario_name: spark-executor-failure
 description: >
-  Spark job failure due to lost executors, executor heartbeat timeouts, or
-  blacklisted nodes. Executors may be lost due to infrastructure issues,
-  resource contention, network partitions, or Kubernetes pod evictions.
-  This scenario covers executor communication failures that prevent task completion.
+  Investigation procedure for Spark job failures due to lost executors, heartbeat
+  timeouts, or repeated executor terminations.
 severity: SEVERE
-symptoms:
-  - "ExecutorLostFailure: Executor heartbeat timed out after N ms"
-  - "WARN TaskSetManager: Lost task on executor — executor lost"
-  - "Executor is not registered or has been removed"
-  - "SparkException: Job aborted due to stage failure — executor lost"
-  - "Node blacklisted due to repeated executor failures"
-  - "Spark driver lost communication with one or more executors"
-  - "Pod evicted or preempted by Kubernetes scheduler"
+data_sources:
+  shs: "Spark History Server MCP — executor lifecycle, removal reasons, stage progress"
+  cloudwatch_logs: "CloudWatch log group /emr-on-eks/<env> — executor heartbeat and loss messages"
+  eks: "Kubernetes pod events, evictions, node conditions in namespace emr-data-team-a"
+  cloudwatch_metrics: "AWS/EMRContainers namespace — job run state, container metrics"
 investigation_steps:
   - step_number: 1
-    description: "Retrieve the Amazon EMR job run status and identify executor-related failure details"
-    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
-    expected_output: "Job state FAILED with failureReason referencing executor loss or stage failure"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Identify the failed application"
+    sources: ["shs"]
+    shs_tool: "get_application_list"
+    what_to_look_for: "Find the failed app. Note application ID and failure time."
   - step_number: 2
-    description: "Search CloudWatch Logs for executor lost and heartbeat timeout patterns"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
-      --filter-pattern "\"ExecutorLostFailure\" OR \"heartbeat timed out\" OR \"executor lost\" OR \"blacklisted\""
-      --limit 50
-    expected_output: "Log entries showing which executors were lost, timestamps, and associated error messages"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Examine executor lifecycle"
+    sources: ["shs"]
+    shs_tool: "get_executor_list"
+    what_to_look_for: "Which executors were removed? What are their removal reasons and timestamps? Are removals concentrated in time or spread out?"
   - step_number: 3
-    description: "Retrieve Spark driver and executor logs to determine the root cause of executor loss"
-    command: "get_spark_logs({virtual_cluster_id}, {job_id})"
-    expected_output: "Driver logs showing executor deregistration events and executor logs showing shutdown reasons"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Check what stage was running when executors died"
+    sources: ["shs"]
+    shs_tool: "get_stage_list"
+    what_to_look_for: "Which stage was active at the executor removal timestamps? Was it a shuffle-heavy or memory-intensive stage?"
   - step_number: 4
-    description: "Check Spark History Server for executor timeline and failure events"
-    command: "get_spark_history_executors({application_id})"
-    expected_output: "Executor list showing removed executors with removal reasons and timestamps"
-    parameters:
-      - application_id
+    action: "Search logs for executor loss details"
+    sources: ["cloudwatch_logs"]
+    log_group: "/emr-on-eks/<env>"
+    what_to_look_for: "Messages about executor lost, heartbeat timeout, or task failures. Note the time gap between last heartbeat and declaration of loss."
   - step_number: 5
-    description: "Query CloudWatch metrics for executor count and node health during the failure window"
-    command: >
-      get_emr_metrics({virtual_cluster_id},
-      start_time=failure_time-30m, end_time=failure_time+5m)
-    expected_output: "Metrics showing executor count drop, CPU/memory spikes, or network errors correlating with executor loss"
-    parameters:
-      - virtual_cluster_id
+    action: "Check Kubernetes pod events"
+    sources: ["eks"]
+    what_to_look_for: "Pod termination reasons — was it OOMKilled, evicted due to node pressure, preempted, or terminated by Karpenter/spot interruption?"
   - step_number: 6
-    description: "Check Kubernetes pod events for evictions, preemptions, or node-level issues"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /aws/eks/{cluster_id}/cluster
-      --filter-pattern "\"Evicted\" OR \"Preempted\" OR \"NodeNotReady\" OR \"FailedScheduling\" OR \"BackOff\""
-      --start-time failure_time_epoch_minus_15m
-      --limit 30
-    expected_output: "Kubernetes events showing pod evictions, node failures, or scheduling issues affecting executor pods"
-    parameters:
-      - cluster_id
+    action: "Check if failures are node-concentrated"
+    sources: ["eks"]
+    what_to_look_for: "Are failed pods on the same node? If yes, check node conditions (memory pressure, disk pressure, NotReady)."
   - step_number: 7
-    description: "Check if executor failures are concentrated on specific nodes indicating a node-level problem"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /emr-on-eks/{virtual_cluster_id}/jobs/{job_id}
-      --filter-pattern "\"node\" AND (\"failed\" OR \"lost\" OR \"blacklisted\")"
-      --limit 20
-    expected_output: "Patterns showing repeated failures on the same node IP or hostname"
-    parameters:
-      - virtual_cluster_id
-      - job_id
-root_cause_patterns:
-  - "Executor heartbeat timeout due to GC pauses — long garbage collection stops prevent heartbeat responses within spark.network.timeout"
-  - "Kubernetes pod eviction due to node memory pressure — the node is under memory pressure and evicts executor pods"
-  - "Network partition between driver and executors — transient network issues in the Amazon EKS cluster cause heartbeat failures"
-  - "Node failure or spot instance termination — the underlying EC2 instance was terminated or became unhealthy"
-  - "Resource contention from co-located workloads — other pods on the same node consume excessive CPU or memory"
-  - "Executor killed by Kubernetes for exceeding resource limits — memory or ephemeral storage limits exceeded"
-  - "Disk pressure on executor nodes — local disk fills up from shuffle data or temp files causing executor failure"
-remediation_actions:
-  - "Increase heartbeat timeout: set spark.network.timeout=600s and spark.executor.heartbeatInterval=30s"
-  - "Enable executor retry: set spark.task.maxFailures=4 and spark.stage.maxConsecutiveAttempts=4"
-  - "Use dedicated node groups: configure node affinity to run Spark executors on dedicated Amazon EKS node groups"
-  - "Increase executor resources: raise spark.executor.memory and spark.executor.cores to reduce resource pressure"
-  - "Enable dynamic allocation: set spark.dynamicAllocation.enabled=true to replace lost executors automatically"
-  - "Configure pod disruption budgets: set PDBs for executor pods to prevent simultaneous evictions"
-  - "Switch from spot to on-demand instances for critical jobs to avoid spot terminations"
-  - "Increase local disk space: use larger EBS volumes or instance store for shuffle-heavy workloads"
-related_metrics:
-  - "ExecutorCount"
-  - "ExecutorRunTime"
-  - "NodeStatus"
-  - "PodRestartCount"
-  - "NetworkErrorCount"
-  - "CPUUtilization"
-log_patterns:
-  - "ExecutorLostFailure"
-  - "heartbeat timed out"
-  - "executor.*lost"
-  - "blacklisted"
-  - "Evicted"
-  - "NodeNotReady"
-  - "executor is not registered"
-escalation_contacts:
-  - "emr-platform-team@company.com"
-  - "eks-infrastructure-team@company.com"
+    action: "Check executor resource usage before death"
+    sources: ["shs"]
+    shs_tool: "get_stage_details"
+    what_to_look_for: "Was there heavy spill or shuffle activity in the active stage? High memory pressure could trigger GC pauses that exceed heartbeat timeout."
+  - step_number: 8
+    action: "Correlate findings"
+    sources: ["shs", "cloudwatch_logs", "eks"]
+    what_to_look_for: >
+      Match pod termination events with SHS executor removal times.
+      Determine if the cause is resource exhaustion, infrastructure (node/spot), or network.
+platform_notes:
+  - "Default heartbeat timeout is 120s. Long GC pauses can exceed this, causing the driver to mark executors as lost even though they're still running."
+  - "Karpenter consolidation or spot interruption terminates nodes with 30s notice. Executor pods on those nodes are lost."
+  - "EMR on EKS executor pods don't have pod disruption budgets by default. Node drains will terminate them immediately."
+  - "If dynamic allocation is enabled, removed executors may be intentional (idle timeout) not failures. Check the removal reason."
+remediation:
+  heartbeat_tuning:
+    - "Increase spark.network.timeout and spark.executor.heartbeatInterval"
+    - "Increase spark.task.maxFailures and spark.stage.maxConsecutiveAttempts"
+  resource_allocation:
+    - "Increase executor memory to reduce GC pressure"
+    - "Use dedicated node groups with on-demand instances for critical jobs"
+  infrastructure:
+    - "Add pod disruption budgets for executor pods"
+    - "Configure Karpenter do-not-disrupt annotations for long-running jobs"
 tags:
   - executor
   - heartbeat
   - timeout
-  - blacklist
   - kubernetes
   - pod-eviction

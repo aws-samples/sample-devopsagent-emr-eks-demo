@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Deploy the DevOps Agent layer: S3, AOSS, Bedrock KB, EventBridge rule
+# Deploy the DevOps Agent layer: S3, AOSS (vector store), Bedrock KB
 set -euo pipefail
 
 CONFIG_FILE="config.env"
 info()  { echo -e "\033[36m[INFO]\033[0m  $*"; }
 error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 ok()    { echo -e "\033[32m[OK]\033[0m    $*"; }
+warn()  { echo -e "\033[33m[WARN]\033[0m  $*"; }
 
 if [ ! -f "$CONFIG_FILE" ]; then
   error "$CONFIG_FILE not found. Copy config.env.template and fill in values."
@@ -22,7 +23,7 @@ REGION="${AWS_REGION}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 info "Stack: $STACK | Region: $REGION | Account: $ACCOUNT_ID"
 
-# --- Step 1: Deploy CloudFormation (S3, access-logs bucket, AOSS) ---
+# --- Step 1: Deploy CloudFormation (S3, KB role, AOSS) ---
 info "Deploying CloudFormation ..."
 aws cloudformation deploy \
   --template-file infrastructure/template.yaml \
@@ -39,17 +40,11 @@ get_output() {
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
 
-# S3 bucket security: AWS manages S3 infrastructure (durability, availability,
-# encryption at rest). You are responsible for monitoring access logs, reviewing
-# bucket policies periodically, and setting object lifecycle policies. See
-# infrastructure/template.yaml for the hardened configuration (BPA, SSE-S3,
-# HTTPS-only bucket policy, server access logging) and docs/SECURITY_CONSIDERATIONS.md
-# for the full shared responsibility breakdown.
 BUCKET=$(get_output "DataBucketName")
 KB_ROLE_ARN=$(get_output "KBRoleArn")
 AOSS_ARN=$(get_output "AossCollectionArn")
 
-# --- Step 2: Upload runbooks to S3 (explicit SSE for defense-in-depth) ---
+# --- Step 2: Upload runbooks to S3 ---
 info "Uploading runbooks to s3://$BUCKET/runbooks/ ..."
 aws s3 sync runbooks/ "s3://$BUCKET/runbooks/" --region "$REGION" --delete --sse AES256
 ok "Runbooks uploaded."
@@ -61,23 +56,17 @@ for i in $(seq 1 30); do
   STATUS=$(aws opensearchserverless batch-get-collection \
     --ids "$AOSS_ID" --region "$REGION" \
     --query "collectionDetails[0].status" --output text 2>/dev/null || echo "UNKNOWN")
-  if [ "$STATUS" = "ACTIVE" ]; then
-    ok "AOSS collection is ACTIVE."
-    break
-  fi
+  if [ "$STATUS" = "ACTIVE" ]; then ok "AOSS collection is ACTIVE."; break; fi
   info "  Status: $STATUS (${i}/30, waiting 10s ...)"
   sleep 10
 done
-if [ "$STATUS" != "ACTIVE" ]; then
-  error "AOSS collection did not become ACTIVE in time."
-  exit 1
-fi
+if [ "$STATUS" != "ACTIVE" ]; then error "AOSS collection did not become ACTIVE in time."; exit 1; fi
 
 AOSS_ENDPOINT=$(aws opensearchserverless batch-get-collection \
   --ids "$AOSS_ID" --region "$REGION" \
   --query "collectionDetails[0].collectionEndpoint" --output text)
 
-# --- Step 4: Create vector index in AOSS (if not exists) ---
+# --- Step 4: Create vector index in AOSS (dashboard is public during this step) ---
 INDEX_NAME="${ENVIRONMENT_NAME}-emr-runbooks-index"
 info "Creating vector index $INDEX_NAME in AOSS ..."
 INDEX_RESULT=$(awscurl --service aoss --region "$REGION" \
@@ -106,15 +95,43 @@ else
   info "Index creation response: $INDEX_RESULT"
 fi
 
-# --- Step 5: Create Bedrock Knowledge Base ---
-KB_NAME="${ENVIRONMENT_NAME}-emr-runbooks-kb"
-EXISTING_KB=$(aws bedrock-agent list-knowledge-bases --region "$REGION" \
-  --query "knowledgeBaseSummaries[?name=='${KB_NAME}' && status=='ACTIVE'].knowledgeBaseId" --output text 2>/dev/null || echo "")
+# --- Step 4b: Lock down the network policy — remove dashboard public access ---
+# Now that the index exists, no public access is needed. Both collection and
+# dashboard are restricted to Bedrock service access only. This eliminates the
+# standing public endpoint (security + avoids SpringClean alerts).
+info "Locking down AOSS network policy (removing public access) ..."
+NET_POLICY_NAME="${ENVIRONMENT_NAME}-emr-kb-net"
+NET_VERSION=$(aws opensearchserverless get-security-policy \
+  --name "$NET_POLICY_NAME" --type network --region "$REGION" \
+  --query "securityPolicyDetail.policyVersion" --output text)
+aws opensearchserverless update-security-policy \
+  --name "$NET_POLICY_NAME" --type network \
+  --policy-version "$NET_VERSION" \
+  --policy '[{"Rules":[{"ResourceType":"collection","Resource":["collection/'"${ENVIRONMENT_NAME}"'-emr-kb"]},{"ResourceType":"dashboard","Resource":["collection/'"${ENVIRONMENT_NAME}"'-emr-kb"]}],"AllowFromPublic":false,"SourceServices":["bedrock.amazonaws.com"]}]' \
+  --region "$REGION" > /dev/null 2>&1 || true
+ok "AOSS network policy locked down — no public access."
 
-if [ -n "$EXISTING_KB" ] && [ "$EXISTING_KB" != "None" ]; then
+# --- Step 5: Create Bedrock Knowledge Base (AOSS vector store) ---
+KB_PREFIX="${ENVIRONMENT_NAME}-emr-runbooks-kb"
+
+# Find any existing ACTIVE KB with our prefix that uses the CURRENT AOSS collection
+EXISTING_KB=""
+for CANDIDATE in $(aws bedrock-agent list-knowledge-bases --region "$REGION" \
+  --query "knowledgeBaseSummaries[?starts_with(name,'${KB_PREFIX}') && status=='ACTIVE'].knowledgeBaseId" --output text 2>/dev/null); do
+  CANDIDATE_AOSS=$(aws bedrock-agent get-knowledge-base --knowledge-base-id "$CANDIDATE" --region "$REGION" \
+    --query "knowledgeBase.storageConfiguration.opensearchServerlessConfiguration.collectionArn" --output text 2>/dev/null || echo "")
+  if [ "$CANDIDATE_AOSS" = "$AOSS_ARN" ]; then
+    EXISTING_KB="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -n "$EXISTING_KB" ]; then
   KB_ID="$EXISTING_KB"
   ok "Bedrock KB already exists: $KB_ID"
 else
+  # Generate unique name to avoid collision with orphaned KBs
+  KB_NAME="${KB_PREFIX}-$(date +%s)"
   info "Creating Bedrock Knowledge Base: $KB_NAME ..."
   KB_ID=$(aws bedrock-agent create-knowledge-base \
     --name "$KB_NAME" \
@@ -166,12 +183,11 @@ echo "============================================="
 echo "  S3 Bucket         : $BUCKET"
 echo "  Knowledge Base ID : $KB_ID"
 echo "  Data Source ID    : $DS_ID"
-echo "  AOSS Collection   : $AOSS_ID"
+echo "  AOSS Collection   : $AOSS_ID (network: private, Bedrock-only)"
 echo "============================================="
 echo ""
 echo "Next steps:"
-echo "  1. make deploy-mcp          (Runbook MCP → Amazon Bedrock AgentCore)"
-echo "  2. Deploy Spark History Server (see spark-history-mcp/)"
-echo "  3. Set up DevOps Agent Space (see AGENT_SPACE_SETUP_PRIVATE.md)"
-echo "  4. make submit-job           (test good job)"
-echo "  5. make inject-oom           (inject fault + investigate)"
+echo "  1. bash scripts/deploy-shs.sh              (Spark History Server)"
+echo "  2. bash scripts/deploy-mcp-server.sh       (Runbook MCP → AgentCore)"
+echo "  3. bash scripts/deploy-shs-mcp-private.sh  (SHS MCP via Helm + NLB)"
+echo "  4. Set up DevOps Agent Space (see docs/AGENT_SPACE_SETUP.md)"

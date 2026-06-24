@@ -51,7 +51,7 @@ aws eks associate-access-policy \
   --cluster-name $EKS_CLUSTER \
   --principal-arn "$AGENT_ROLE_ARN" \
   --policy-arn "arn:aws:eks::aws:cluster-access-policy/AmazonAIOpsAssistantPolicy" \
-  --access-scope type=cluster \
+  --access-scope type=namespace,namespaces=emr-data-team-a,spark-history \
   --region $AWS_REGION
 ```
 
@@ -181,16 +181,21 @@ This registers the Runbook MCP (3 tools) that searches Amazon Bedrock Knowledge 
 **Get the values:**
 
 ```bash
-# Amazon Bedrock AgentCore Runtime ARN
-aws cloudformation describe-stacks --stack-name AgentCore-runbookmcp-default --region $AWS_REGION \
-  --query "Stacks[0].Outputs[?OutputKey=='RuntimeArn'].OutputValue" --output text
+# Run show-setup-values.sh for all values at once, or individually:
+
+# AgentCore invocation endpoint URL (this is what the console needs)
+RUNTIME_ARN=$(aws cloudformation describe-stacks --stack-name AgentCore-runbookmcp-default --region $AWS_REGION \
+  --query "Stacks[0].Outputs[?contains(OutputKey,'RuntimeArn')].OutputValue" --output text)
+ESCAPED_ARN=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$RUNTIME_ARN")
+ENDPOINT_URL="https://bedrock-agentcore.${AWS_REGION}.amazonaws.com/runtimes/${ESCAPED_ARN}/invocations?qualifier=DEFAULT"
+echo "Endpoint URL: $ENDPOINT_URL"
 
 # Cognito credentials
 POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region $AWS_REGION \
   --query "UserPools[?Name=='emr-spark-mcp-pool'].Id" --output text)
 
 CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$POOL_ID" --region $AWS_REGION \
-  --query "UserPoolClients[?ClientName=='devops-agent-client'].ClientId" --output text)
+  --query "UserPoolClients[?ClientName=='emr-spark-mcp-client'].ClientId" --output text)
 
 CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client --user-pool-id "$POOL_ID" \
   --client-id "$CLIENT_ID" --region $AWS_REGION \
@@ -199,7 +204,6 @@ CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client --user-pool-id "$POOL_
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 TOKEN_URL="https://emr-spark-mcp-${ACCOUNT_ID}.auth.${AWS_REGION}.amazoncognito.com/oauth2/token"
 
-echo "Runtime ARN : (from first command above)"
 echo "Client ID   : $CLIENT_ID"
 echo "Client Secret: $CLIENT_SECRET"
 echo "Token URL   : $TOKEN_URL"
@@ -213,12 +217,12 @@ echo "Token URL   : $TOKEN_URL"
 | Field | What to enter |
 |-------|---------------|
 | Name | `emr-spark-runbook-mcp` |
-| Endpoint URL | The Runtime ARN from the command above |
+| Endpoint URL | The full HTTPS endpoint URL from the command above (starts with `https://bedrock-agentcore...`) |
 | Auth type | OAuth Client Credentials |
 | Client ID | From the command above |
 | Client Secret | From the command above |
 | Token Exchange URL | The Token URL from the command above |
-| Scope | `openid` |
+| Scope | `mcp-api/invoke` |
 
 3. Click **Submit**
 

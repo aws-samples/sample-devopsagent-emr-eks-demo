@@ -65,23 +65,31 @@ echo ""
 
 # ── Runbook MCP Server ────────────────────────────────────────────────────
 echo "── 5. Register Runbook MCP Server ──"
-RUNTIME_ARN=$(aws cloudformation describe-stacks --stack-name AgentCore-runbookmcp-default --region us-east-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='RuntimeArn'].OutputValue" --output text 2>/dev/null || echo "UNKNOWN")
+RUNTIME_ARN=$(aws cloudformation describe-stacks --stack-name AgentCore-runbookmcp-default --region "$REGION" \
+  --query "Stacks[0].Outputs[?contains(OutputKey,'RuntimeArn')].OutputValue" --output text 2>/dev/null || echo "")
 POOL_ID=$(aws cognito-idp list-user-pools --max-results 20 --region "$REGION" \
-  --query "UserPools[?Name=='emr-spark-mcp-pool'].Id" --output text 2>/dev/null || echo "UNKNOWN")
+  --query "UserPools[?Name=='emr-spark-mcp-pool'].Id" --output text 2>/dev/null || echo "")
 CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$POOL_ID" --region "$REGION" \
-  --query "UserPoolClients[?ClientName=='devops-agent-client'].ClientId" --output text 2>/dev/null || echo "UNKNOWN")
+  --query "UserPoolClients[?ClientName=='emr-spark-mcp-client'].ClientId" --output text 2>/dev/null || echo "")
 CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID" --region "$REGION" \
-  --query "UserPoolClient.ClientSecret" --output text 2>/dev/null || echo "UNKNOWN")
+  --query "UserPoolClient.ClientSecret" --output text 2>/dev/null || echo "")
 COGNITO_DOMAIN="https://emr-spark-mcp-${ACCOUNT_ID}.auth.${REGION}.amazoncognito.com/oauth2/token"
 
+# Build the full AgentCore invocation endpoint URL from the runtime ARN
+if [ -n "$RUNTIME_ARN" ] && [ "$RUNTIME_ARN" != "None" ]; then
+  ESCAPED_ARN=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$RUNTIME_ARN")
+  MCP_ENDPOINT="https://bedrock-agentcore.${REGION}.amazonaws.com/runtimes/${ESCAPED_ARN}/invocations?qualifier=DEFAULT"
+else
+  MCP_ENDPOINT="UNKNOWN (AgentCore stack not found — run deploy-mcp-server.sh)"
+fi
+
 echo "  Name       : runbook-mcp"
-echo "  Endpoint   : $RUNTIME_ARN"
+echo "  Endpoint   : $MCP_ENDPOINT"
 echo "  Auth       : OAuth Client Credentials"
 echo "    Client ID     : $CLIENT_ID"
 echo "    Client Secret : $CLIENT_SECRET"
 echo "    Token URL     : $COGNITO_DOMAIN"
-echo "    Scope         : openid"
+echo "    Scope         : mcp-api/invoke"
 echo ""
 
 echo "============================================="

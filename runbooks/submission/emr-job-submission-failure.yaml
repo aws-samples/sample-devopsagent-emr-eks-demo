@@ -1,113 +1,64 @@
 scenario_name: emr-job-submission-failure
 description: >
-  Amazon EMR on Amazon EKS job submission failure. The job fails to start or is immediately
-  rejected by the Amazon EMR service. Covers virtual cluster connectivity issues,
-  IAM permission errors, invalid Spark configurations, S3 access failures
-  for job artifacts, and Amazon EKS namespace misconfigurations.
+  Investigation procedure for Amazon EMR on Amazon EKS job submission failures.
+  The job fails to start or is immediately rejected before any Spark code runs.
 severity: SEVERE
-symptoms:
-  - "StartJobRun API call returns an error or the job transitions to FAILED immediately"
-  - "AccessDeniedException or AuthorizationError in Amazon EMR API response"
-  - "InvalidParameterException for job configuration or execution role"
-  - "Job run state transitions directly from SUBMITTED to FAILED without running"
-  - "Amazon EKS namespace not found or RBAC permission denied for Amazon EMR service account"
-  - "S3 access denied when fetching job entrypoint script or dependencies"
+data_sources:
+  cloudwatch_logs: "CloudWatch log group /emr-on-eks/<env> — submission error details if any logs were emitted"
+  eks: "Kubernetes namespace status, service account, RBAC bindings in emr-data-team-a"
+  cloudwatch_metrics: "AWS/EMRContainers namespace — job submission counts and failures"
+  emr_api: "EMR on EKS DescribeJobRun API — failure reason and state history"
 investigation_steps:
   - step_number: 1
-    description: "Retrieve the Amazon EMR job run status and capture the detailed failure reason"
-    command: "get_emr_job_status({virtual_cluster_id}, {job_id})"
-    expected_output: "Job state FAILED with failureReason indicating submission error (IAM, config, or connectivity)"
-    parameters:
-      - virtual_cluster_id
-      - job_id
+    action: "Get the job run details and failure reason"
+    sources: ["emr_api"]
+    what_to_look_for: "Use DescribeJobRun to get the failureReason and stateDetails. Note if the job went directly from SUBMITTED to FAILED without RUNNING."
   - step_number: 2
-    description: "Check CloudTrail for the StartJobRun API call and any associated authorization errors"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /aws/cloudtrail
-      --filter-pattern "\"StartJobRun\" AND (\"{virtual_cluster_id}\" OR \"AccessDenied\" OR \"AuthorizationError\")"
-      --limit 20
-    expected_output: "CloudTrail event showing the API call result, error code, and the IAM principal that made the request"
-    parameters:
-      - virtual_cluster_id
+    action: "Check if the failure is IAM-related"
+    sources: ["emr_api"]
+    what_to_look_for: "Does the failure reason mention AccessDenied, not authorized, or role cannot be assumed? If so, investigate the execution role."
   - step_number: 3
-    description: "Verify the execution role ARN is valid and has the required trust policy for Amazon EMR on Amazon EKS"
-    command: >
-      aws iam get-role --role-name {execution_role_name}
-    expected_output: "Role details showing trust policy with emr-containers.amazonaws.com as a trusted principal"
-    parameters:
-      - execution_role_name
+    action: "Check the EKS namespace and virtual cluster"
+    sources: ["eks"]
+    what_to_look_for: "Does the namespace exist? Is the EMR virtual cluster in RUNNING state? Are RBAC bindings present for the EMR service account?"
   - step_number: 4
-    description: "Check if the virtual cluster is in RUNNING state and the Amazon EKS namespace exists"
-    command: >
-      aws emr-containers describe-virtual-cluster
-      --id {virtual_cluster_id}
-    expected_output: "Virtual cluster state RUNNING with valid Amazon EKS cluster and namespace configuration"
-    parameters:
-      - virtual_cluster_id
+    action: "Verify the job entrypoint is accessible"
+    sources: ["cloudwatch_logs"]
+    what_to_look_for: "S3 access denied or file-not-found errors for the entrypoint script path."
   - step_number: 5
-    description: "Verify S3 access for the job entrypoint script and dependency JARs"
-    command: >
-      aws s3 ls s3://{job_s3_bucket}/jobs/ --region {region}
-    expected_output: "Listing of job artifacts confirming the entrypoint script exists and is accessible"
-    parameters:
-      - job_s3_bucket
-      - region
+    action: "Check for configuration errors"
+    sources: ["emr_api"]
+    what_to_look_for: "InvalidParameterException in the failure reason — unsupported Spark config, invalid release label, or malformed job parameters."
   - step_number: 6
-    description: "Search CloudWatch Logs for Amazon EKS-level errors related to Amazon EMR job pod creation"
-    command: >
-      aws logs filter-log-events
-      --log-group-name /aws/eks/{cluster_id}/cluster
-      --filter-pattern "\"emr-containers\" AND (\"error\" OR \"denied\" OR \"forbidden\" OR \"not found\")"
-      --start-time failure_time_epoch_minus_10m
-      --limit 20
-    expected_output: "EKS audit logs showing RBAC denials or namespace issues for Amazon EMR service account"
-    parameters:
-      - cluster_id
+    action: "Check service quotas"
+    sources: ["cloudwatch_metrics"]
+    what_to_look_for: "Are there many concurrent job runs? EMR on EKS has per-virtual-cluster concurrency limits."
   - step_number: 7
-    description: "Validate the Spark configuration parameters in the job submission request"
-    command: "get_spark_logs({virtual_cluster_id}, {job_id})"
-    expected_output: "Any available logs showing Spark configuration validation errors or invalid parameter warnings"
-    parameters:
-      - virtual_cluster_id
-      - job_id
-root_cause_patterns:
-  - "IAM execution role missing required permissions — the role lacks S3, CloudWatch Logs, or AWS Glue permissions needed by the Spark job"
-  - "Execution role trust policy does not include emr-containers.amazonaws.com — Amazon EMR cannot assume the role"
-  - "Virtual cluster in TERMINATED or ARRESTED state — the virtual cluster is no longer active"
-  - "Amazon EKS namespace does not exist or EMR RBAC not configured — the Kubernetes namespace for EMR is missing or lacks required role bindings"
-  - "S3 entrypoint path incorrect or bucket policy denies access — the job script cannot be fetched from S3"
-  - "Invalid Spark configuration — unsupported or conflicting Spark properties in the job submission"
-  - "AWS service quota exceeded — Amazon EMR on Amazon EKS concurrent job run limit reached for the virtual cluster"
-remediation_actions:
-  # Ordered by likelihood + impact. Fix the first match for your symptoms.
-  - "Fix IAM execution role — attach policies for s3:GetObject, s3:PutObject (scoped to job output prefixes) on the job bucket, logs:CreateLogStream, logs:PutLogEvents, and glue:GetTable. Verify with: aws iam simulate-principal-policy --policy-source-arn <role-arn> --action-names s3:GetObject --resource-arns arn:aws:s3:::<bucket>/*"
-  - "Update trust policy — add emr-containers.amazonaws.com to the role trust relationship. Verify with: aws iam get-role --role-name <role> --query 'Role.AssumeRolePolicyDocument'"
-  - "Fix Amazon S3 entrypoint path — verify the entrypoint script exists at the specified Amazon S3 URI and the bucket policy allows access. Check with: aws s3api head-object --bucket <bucket> --key <key>"
-  - "Verify virtual cluster state — run 'aws emr-containers describe-virtual-cluster --id {virtual_cluster_id}' and recreate if TERMINATED"
-  - "Configure Amazon EKS namespace — ensure the namespace exists and run 'eksctl create iamidentitymapping' for the Amazon EMR service role"
-  - "Validate Spark config — review spark-submit parameters against Amazon EMR on Amazon EKS supported configurations"
-  - "Request quota increase — submit an AWS service quota increase request for Amazon EMR on Amazon EKS concurrent job runs"
-related_metrics:
-  - "JobSubmissionCount"
-  - "JobSubmissionFailureCount"
-  - "APICallCount"
-  - "ThrottlingCount"
-log_patterns:
-  - "AccessDeniedException"
-  - "AuthorizationError"
-  - "InvalidParameterException"
-  - "not authorized"
-  - "role.*cannot be assumed"
-  - "namespace.*not found"
-  - "quota.*exceeded"
-escalation_contacts:
-  - "emr-platform-team@company.com"
-  - "cloud-security-team@company.com"
+    action: "Correlate findings"
+    sources: ["emr_api", "eks", "cloudwatch_logs"]
+    what_to_look_for: >
+      Determine the category of failure: IAM/permissions, configuration error,
+      S3 access, namespace issue, or quota limit.
+platform_notes:
+  - "EMR on EKS execution role needs a trust policy for emr-containers.amazonaws.com AND the specific virtual cluster condition."
+  - "The execution role needs S3 read access to the entrypoint script bucket AND path."
+  - "Jobs that fail at submission never produce Spark event logs — SHS will have no data for these."
+  - "CloudWatch log streams are only created if the driver pod actually started. Submission failures may have no logs at all."
+remediation:
+  iam_fix:
+    - "Verify execution role trust policy includes emr-containers.amazonaws.com"
+    - "Verify role has s3:GetObject on the entrypoint script path"
+    - "Verify role has logs:CreateLogStream and logs:PutLogEvents for the configured log group"
+  configuration_fix:
+    - "Validate Spark configuration properties against the release label documentation"
+    - "Verify the S3 entrypoint path exists and is a valid Python/Jar file"
+  infrastructure_fix:
+    - "Confirm virtual cluster is in RUNNING state"
+    - "Verify namespace exists with correct EMR RBAC bindings"
+    - "Request quota increase if concurrent limit is reached"
 tags:
   - submission
   - iam
   - permissions
   - virtual-cluster
   - configuration
-  - eks

@@ -21,7 +21,7 @@ fi
 
 # Get KB and bucket from stack outputs
 KB_ID=$(aws bedrock-agent list-knowledge-bases --region "$REGION" \
-  --query "knowledgeBaseSummaries[?name=='${ENVIRONMENT_NAME}-emr-runbooks-kb'].knowledgeBaseId" --output text)
+  --query "knowledgeBaseSummaries[?starts_with(name,'${ENVIRONMENT_NAME}-emr-runbooks-kb') && status=='ACTIVE'].knowledgeBaseId" --output text)
 # S3 bucket security: BPA, SSE-S3 (AES-256), HTTPS-only bucket policy, and
 # server access logging are all configured in infrastructure/template.yaml
 # (DataBucket + DataBucketPolicy + LoggingBucket resources). This script only
@@ -283,35 +283,10 @@ aws iam put-role-policy --role-name "$ROLE_NAME" \
         "Condition": {
           "StringEquals": {"cloudwatch:namespace": "AWS/EMRContainers"}
         }
-      },
-      {
-        "Sid": "OpenSearchServerlessAccess",
-        "Effect": "Allow",
-        "Action": ["aoss:APIAccessAll"],
-        "Resource": "arn:aws:aoss:'"$REGION"':'"$ACCOUNT_ID"':collection/*",
-        "Condition": {
-          "StringEquals": {"aws:PrincipalAccount": "'"$ACCOUNT_ID"'"}
-        }
       }
     ]
   }'
-
-# --- Step 7: Add Amazon Bedrock AgentCore role to Amazon OpenSearch Serverless data access policy ---
-info "Adding runtime role to AOSS data access policy ..."
-AOSS_POLICY_NAME="${ENVIRONMENT_NAME}-emr-kb-access"
-AOSS_POLICY_VERSION=$(aws opensearchserverless get-access-policy \
-  --name "$AOSS_POLICY_NAME" --type data --region "$REGION" \
-  --query 'accessPolicyDetail.policyVersion' --output text)
-AOSS_COLLECTION_NAME="${ENVIRONMENT_NAME}-emr-kb"
-KB_ROLE_ARN=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='KBRoleArn'].OutputValue" --output text)
-
-aws opensearchserverless update-access-policy \
-  --name "$AOSS_POLICY_NAME" --type data \
-  --policy-version "$AOSS_POLICY_VERSION" \
-  --policy '[{"Rules":[{"ResourceType":"index","Resource":["index/'"$AOSS_COLLECTION_NAME"'/*"],"Permission":["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"]},{"ResourceType":"collection","Resource":["collection/'"$AOSS_COLLECTION_NAME"'"],"Permission":["aoss:CreateCollectionItems","aoss:DeleteCollectionItems","aoss:DescribeCollectionItems","aoss:UpdateCollectionItems"]}],"Principal":["'"$KB_ROLE_ARN"'","arn:aws:iam::'"$ACCOUNT_ID"':root","'"$ROLE_ARN"'"]}]' \
-  --region "$REGION" > /dev/null
-ok "AOSS data access policy updated."
+ok "IAM policies added."
 
 # Save deploy dir for future updates
 PERSIST_DIR="/tmp/runbook-mcp-deploy"
